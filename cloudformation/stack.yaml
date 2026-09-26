@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Interview demo - VPC, EC2 web tier, private RDS tier, S3 and IAM.
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Current Amazon Linux AMI ID in your region.
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: 10.10.0.0/16, Tags: [{Key: Name, Value: cloud-migration-vpc}]}
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.10.1.0/24, AvailabilityZone: !Select [0, !GetAZs ''], MapPublicIpOnLaunch: true}
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.10.11.0/24, AvailabilityZone: !Select [0, !GetAZs '']}
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.10.12.0/24, AvailabilityZone: !Select [1, !GetAZs '']}
+  InternetGateway: {Type: AWS::EC2::InternetGateway}
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway}
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet, RouteTableId: !Ref RouteTable}
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 5000, ToPort: 5000, CidrIp: 0.0.0.0/0}
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database access from web tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref WebSG}
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: [ec2.amazonaws.com]}, Action: [sts:AssumeRole]}]
+      Policies:
+        - PolicyName: S3ReadWriteDemo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{Effect: Allow, Action: ['s3:GetObject','s3:PutObject','s3:ListBucket'], Resource: '*'}]
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref AppRole]}
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref WebSG]
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags: [{Key: Name, Value: cloud-migration-web}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y || yum update -y
+          dnf install -y python3-pip git || yum install -y python3-pip git
+          # Replace this URL after creating the GitHub repository.
+          # git clone https://github.com/REPLACE_WITH_YOUR_USERNAME/aws-3tier-cloud-migration.git /opt/app
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      VersioningConfiguration: {Status: Enabled}
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private RDS subnets
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      AllocatedStorage: '20'
+      MasterUsername: appuser
+      MasterUserPassword: !Ref DBPassword
+      DBName: appdb
+      PubliclyAccessible: false
+      VPCSecurityGroups: [!Ref DbSG]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+Outputs:
+  WebInstanceId: {Value: !Ref WebServer}
+  BucketName: {Value: !Ref DataBucket}
+  DatabaseEndpoint: {Value: !GetAtt Database.Endpoint.Address}
